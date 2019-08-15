@@ -14,16 +14,17 @@ if DUT_SQLITE
 DUT += sqlite.cc
 endif
 
+DUT += hive.cpp
+
 
 sqlsmith_SOURCES = relmodel.cc schema.cc $(DUT)	 			\
     random.cc prod.cc expr.cc grammar.cc log.cc dump.cc impedance.cc	\
     sqlsmith.cc
 
-sqlsmith_LDADD = $(LIBPQXX_LIBS) $(MONETDB_MAPI_LIBS) $(BOOST_REGEX_LIB) $(POSTGRESQL_LIBS)
+sqlsmith_LDADD = $(LIBPQXX_LIBS) $(MONETDB_MAPI_LIBS) $(BOOST_REGEX_LIB) $(POSTGRESQL_LIBS) -L./ -lhs2client -lhs2client_thrift
 
-AM_LDFLAGS = $(BOOST_LDFLAGS) $(POSTGRESQL_LDFLAGS)
+AM_LDFLAGS = $(BOOST_LDFLAGS) $(POSTGRESQL_LDFLAGS) -Wl,-undefined,dynamic_lookup
 AM_CPPFLAGS = $(BOOST_CPPFLAGS) $(LIBPQXX_CFLAGS) $(POSTGRESQL_CPPFLAGS) $(MONETDB_MAPI_CFLAGS) -Wall -Wextra
-
 
 EXTRA_DIST = gitrev.h dump.hh expr.hh grammar.hh log.hh prod.hh		\
     random.hh relmodel.hh schema.hh impedance.hh known.txt known_re.txt log.sql	\
