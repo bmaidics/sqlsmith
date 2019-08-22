@@ -4,6 +4,13 @@
 
 #include "hive.h"
 
+#include "hs2client/columnar-row-set.h"
+#include "hs2client/thrift-internal.h"
+
+#include "gen-cpp/TCLIService.h"
+#include "gen-cpp/TCLIService_types.h"
+#include "hs2client/util.h"
+
 using namespace hs2client;
 using namespace std;
 
@@ -56,150 +63,105 @@ void hive_connection::q(const char *query) {
 
 // disconnect hive
 hive_connection::~hive_connection() {
+    cout<<"Hive connection closed" <<endl;
     session->Close();
     service->Close();
 }
 
 //load schema from hive
 schema_hive::schema_hive(std::string &conninfo) : hive_connection(conninfo) {
-    unique_ptr <Operation> show_tables_op;
-    Status status = session->ExecuteStatement("show tables", &show_tables_op);
-    if (!status.ok()) {
-        cout << "Failed to execute GetTables: " << status.GetMessage();
-        show_tables_op->Close();
-        return;
-    }
-    Util::PrintResults(show_tables_op.get(), cout);
-    unique_ptr <ColumnarRowSet> showtables_results;
-    bool has_more_rows = true;
-    int total_retrieved = 0;
-    cout << "Getting tables in given database\n";
-    while (has_more_rows) {
-        status = show_tables_op->Fetch(&showtables_results, &has_more_rows);
-        if (!status.ok()) {
-            cout << "Failed to fetch results: " << status.GetMessage();
-            show_tables_op->Close();
-            return;
-        }
-    }
-    unique_ptr <StringColumn> string_col = showtables_results->GetStringCol(1);
-    for (int64_t i = 0; i < string_col->length(); ++i) {
-        if (string_col->IsNull(i)) {
-            cout << "NULL";
-        } else {
-            cout << "'" << string_col->GetData(i) << "'";
-        }
-    }
-    /*cerr << "init booltype, inttype, internaltype, arraytype here" << endl;
+    cerr << "init booltype, inttype, internaltype, arraytype here" << endl;
     booltype = sqltype::get("boolean");
     inttype = sqltype::get("int");
     internaltype = sqltype::get("internal");
     arraytype = sqltype::get("ARRAY");
 
-    cerr << "Loading tables from database: " << conninfo << endl;
-//	string qry = "select t.name, s.name, t.system, t.type from sys.tables t,  sys.schemas s where t.schema_id=s.id and t.system=false";
-    string qry = "select t.name, s.name, t.system, t.type from sys.tables t,  sys.schemas s where t.schema_id=s.id ";
-    MapiHdl hdl = mapi_query(dbh, qry.c_str());
-    while (mapi_fetch_row(hdl)) {
-        tables.push_back(table(mapi_fetch_field(hdl, 0), mapi_fetch_field(hdl, 1),
-                               strcmp(mapi_fetch_field(hdl, 2), "false") == 0 ? true : false,
-                               atoi(mapi_fetch_field(hdl, 3)) == 0 ? false : true));
+    cerr << "Loading tables...";
+
+    unique_ptr <Operation> op;
+    Status status = session->ExecuteStatement("select table_name, table_schema,is_insertable_into, table_type "
+                                              "from information_schema.tables where table_schema!='information_schema' "
+                                              "and table_schema!='sys'", &op);
+    if (!status.ok()) {
+        cout << "Failed to execute GetTables: " << status.GetMessage();
+        op->Close();
+        return;
     }
-    mapi_close_handle(hdl);
-    cerr << " done." << endl;
+    unique_ptr<ColumnarRowSet> results;
+    bool has_more_rows = true;
+    while (has_more_rows) {
+        Status s = op->Fetch(&results, &has_more_rows);
+        if (!s.ok()) {
+            cout << s.GetMessage();
+            return;
+        }
+
+        std::vector <ColumnDesc> column_descs;
+        s = op->GetResultSetMetadata(&column_descs);
+
+        if (!s.ok()) {
+            cout << s.GetMessage();
+            return;
+        } else if (column_descs.size() == 0) {
+            cout << "No tables found";
+            return;
+        }
+
+        unique_ptr<StringColumn> string_col = results->GetStringCol(0);
+        for (int64_t i = 0; i < string_col->length(); ++i) {
+            string name = results->GetStringCol(0)->GetData(i);
+            string schema = results->GetStringCol(1)->GetData(i);
+            bool insertable = results->GetBoolCol(2)->GetData(i);
+            bool base_table = results->GetBoolCol(3)->GetData(i);
+
+            tables.push_back(table(name, schema, insertable, base_table));
+            cout << name << " " << schema << " " << noboolalpha << insertable << " " << noboolalpha << base_table
+                 << endl;
+        }
+    }
 
     cerr << "Loading columns and constraints...";
-    for (auto t = tables.begin(); t != tables.end(); t++) {
-        string q("select col.name,"
-                 " col.type "
-                 " from sys.columns col, sys.tables tab"
-                 " where tab.name= '");
-        q += t->name;
-        q += "' and tab.id = col.table_id";
 
-        hdl = mapi_query(dbh, q.c_str());
-        while (mapi_fetch_row(hdl)) {
-            column c(mapi_fetch_field(hdl, 0), sqltype::get(mapi_fetch_field(hdl, 1)));
-            t->columns().push_back(c);
+    for (auto t = tables.begin(); t != tables.end(); ++t) {
+        cout << endl << t->name <<":::::" <<endl;
+        string query = "select column_name, data_type from information_schema.columns where table_name='" + t->name + "'";
+        unique_ptr <Operation> op_column;
+
+        Status s_op = session->ExecuteStatement(query, &op_column);
+        if (!s_op.ok()) {
+            cout << "Failed to execute GetColumns: " << s_op.GetMessage();
+            op_column->Close();
+            return;
         }
-        mapi_close_handle(hdl);
-    }
-    // TODO: confirm with Martin or Stefan about column
-    // constraints in hive
-    cerr << " done." << endl;
+        has_more_rows = true;
+        while (has_more_rows) {
+            Status s = op_column->Fetch(&results, &has_more_rows);
+            if (!s.ok()) {
+                cout << s.GetMessage();
+                return;
+            }
 
-    cerr << "Loading operators...";
-    string opq("select f.func, a.type, b.type, c.type"
-               " from sys.functions f, sys.args a, sys.args b, sys.args c"
-               "  where f.id=a.func_id and f.id=b.func_id and f.id=c.func_id and a.name='arg_1' and b.name='arg_2' and c.number=0");
-    hdl = mapi_query(dbh, opq.c_str());
-    while (mapi_fetch_row(hdl)) {
-        op o(mapi_fetch_field(hdl, 0), sqltype::get(mapi_fetch_field(hdl, 1)),
-             sqltype::get(mapi_fetch_field(hdl, 2)), sqltype::get(mapi_fetch_field(hdl, 3)));
-        register_operator(o);
-    }
-    mapi_close_handle(hdl);
-    cerr << " done." << endl;
+            std::vector <ColumnDesc> column_descs;
+            s = op_column->GetResultSetMetadata(&column_descs);
 
+            if (!s.ok()) {
+                cout << s.GetMessage();
+                return;
+            }
 
-    cerr << "Loading routines...";
-    string routq(
-            "select s.name, f.id, a.type, f.name from sys.schemas s, sys.args a, sys.types t, sys.functions f where f.schema_id = s.id and f.id=a.func_id and a.number=0 and a.type = t.sqlname and f.mod<>'aggr'");
-    hdl = mapi_query(dbh, routq.c_str());
-    while (mapi_fetch_row(hdl)) {
-        routine proc(mapi_fetch_field(hdl, 0), mapi_fetch_field(hdl, 1), sqltype::get(mapi_fetch_field(hdl, 2)),
-                     mapi_fetch_field(hdl, 3));
-        register_routine(proc);
-    }
-    mapi_close_handle(hdl);
-    cerr << " done." << endl;
+            unique_ptr<StringColumn> name_col = results->GetStringCol(0);
 
-    cerr << "Loading routine parameters...";
-    for (auto &proc : routines) {
-        string routpq("select a.type from sys.args a,"
-                      " sys.functions f "
-                      " where f.id = a.func_id and a.number <> 0 and f.id = '");
-        routpq += proc.specific_name;
-        routpq += "'";
-        hdl = mapi_query(dbh, routpq.c_str());
-        while (mapi_fetch_row(hdl)) {
-            proc.argtypes.push_back(sqltype::get(mapi_fetch_field(hdl, 0)));
+            for (int64_t i = 0; i < name_col->length(); ++i) {
+                string name = results->GetStringCol(0)->GetData(i);
+                string type = results->GetStringCol(1)->GetData(i);
+                sqltype* stype = sqltype::get(type);
+                cout<<"TYPE: " << stype->name<< endl;
+                column c(name, stype);
+                t->columns().push_back(c);
+                cout << name << " " <<type<<endl;
+            }
         }
-        mapi_close_handle(hdl);
     }
-    cerr << " done." << endl;
-
-
-    cerr << "Loading aggregates...";
-    string aggq(
-            "select s.name, f.id, a.type, f.name from sys.schemas s, sys.args a, sys.types t, sys.functions f where f.schema_id = s.id and f.id=a.func_id and a.number=0 and a.type = t.sqlname and f.mod='aggr'");
-
-    hdl = mapi_query(dbh, aggq.c_str());
-    while (mapi_fetch_row(hdl)) {
-        routine proc(mapi_fetch_field(hdl, 0), mapi_fetch_field(hdl, 1), sqltype::get(mapi_fetch_field(hdl, 2)),
-                     mapi_fetch_field(hdl, 3));
-        register_aggregate(proc);
-    }
-    mapi_close_handle(hdl);
-    cerr << " done." << endl;
-
-    cerr << "Loading aggregates parameters...";
-    for (auto &proc: aggregates) {
-        string aggpq("select a.type from sys.args a, sys.functions f "
-                     "where f.id = a.func_id and a.number <> 0 and f.id = '");
-        aggpq += proc.specific_name;
-        aggpq += "'";
-        hdl = mapi_query(dbh, aggpq.c_str());
-        while (mapi_fetch_row(hdl)) {
-            proc.argtypes.push_back(sqltype::get(mapi_fetch_field(hdl, 0)));
-        }
-        mapi_close_handle(hdl);
-    }
-    cerr << " done." << endl;
-
-    mapi_destroy(dbh);
-    generate_indexes();*/
-
 }
 
 dut_hive::dut_hive(std::string &conninfo) : hive_connection(conninfo) {
